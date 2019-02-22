@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import sys
+
+from google.cloud import storage
+from google.api_core.exceptions import NotFound
+
+from maiar_lib import maiar_lib
+
+
+DEFAULT_ROOT_DIR = '/opt/maiar/'
+
+
+class MaiarBuild:
+    def __init__(self, gcs_client, repo_path, channel, root_dir=None):
+        try:
+            self.repository = gcs_client.get_bucket(repo_path) if gcs_client else None
+        except NotFound:
+            maiar_lib.print_fatal(f'Repository bucket {repo_path} not found in Google Cloud Storage!')
+
+        self.channel = channel
+        self.root_dir = root_dir if root_dir else DEFAULT_ROOT_DIR
+        self.download_dir = os.path.join(self.root_dir, 'downloads')
+        self.build_dir = os.path.join(self.root_dir, 'build')
+        self.downloaded = {}
+        self.built = {}
+        self.installed = {}
+
+        os.makedirs(self.root_dir, exist_ok=True)
+
+        os.chdir(self.root_dir)
+
+
+    def download_file(self, filename, local_path, dry_run=None):
+        if not self.repository:
+            maiar_lib.print_error(f'No repository was set!')
+            return False
+
+        blob = self.repository.blob(filename)
+
+        if not blob.exists():
+            maiar_lib.print_error(f'File {filename} was not found in the repository!')
+            return False
+
+        if dry_run:
+            print(f'Would download: {filename} to {local_path}')
+            return True
+
+        maiar_lib.download_file_with_retries(blob, local_path)
+
+        return True
+
+
+    def download_package(self, package, version, dry_run=None):
+        if package in self.downloaded and self.downloaded[package] == version:
+            return True
+
+        package_id = f'{package}.{version}'
+        package_file = f'{package_id}.tar.bz2'
+        download_location = os.path.join(self.download_dir, package_file)
+
+        if not dry_run:
+            os.makedirs(self.download_dir, exist_ok=True)
+            os.makedirs(self.build_dir, exist_ok=True)
+
+            print(f'Downloading package {package}.{version}')
+
+        # TODO: Build environments for caching of pre-built packages!
+        if not self.download_file(f'{self.channel}/{package_file}', download_location, dry_run=dry_run):
+            return False
+
+        extract_command = ['tar', '-xjf', download_location, package_id]
+
+        if dry_run:
+            print(f'Would run: {" ".join(extract_command)}')
+            return True
+
+        os.chdir(self.build_dir)
+
+        success, output = maiar_lib.run_command_output(extract_command)
+
+        if not success:
+            print(output)
+            maiar_lib.print_error(f'Failed to extract package: {package_file}')
+            return False
+
+        # Delete the downloaded archive as it is no longer needed
+        maiar_lib.run_command_output(['rm', download_location])
+
+        if not success:
+            print(output)
+            return False
+
+        os.chdir(self.root_dir)
+
+        self.downloaded[package] = version
+        return True
+
+
+    def run_script_for_package_stage(self, package, version, stage, dry_run=None):
+        package_id = f'{package}.{version}'
+        build_location = os.path.join(self.build_dir, package_id)
+        os.chdir(build_location)
+
+        for ext in ['.sh', '.bash', '.py', '']:
+            script = f'maiar{ext}'
+            if os.path.exists(script):
+                if dry_run:
+                    print(f'Would run: {script} {stage}')
+                    os.chdir(self.root_dir)
+                    return True
+
+                if maiar_lib.run_shell_command(f'./{script} {stage}', env={'MAIAR_ROOT': self.root_dir}) != 0:
+                    maiar_lib.print_error(f'Failed to {stage} package: {package_id}')
+                    return False
+
+                os.chdir(self.root_dir)
+                return True
+
+        maiar_lib.print_error(f'Could not find {stage} script for package: {package_id}')
+        return False
+
+
+    def build_package(self, package, version, dry_run=None):
+        if not self.download_package(package, version, dry_run=dry_run):
+            return False
+
+        return self.run_script_for_package_stage(package, version, 'build', dry_run=dry_run)
+
+
+    def install_package(self, package, version, dry_run=None):
+        if not self.build_package(package, version, dry_run=dry_run):
+            return False
+
+        return self.run_script_for_package_stage(package, version, 'install', dry_run=dry_run)
+
+
+def parse_package_requirement(line):
+    x = line.find('=')
+    if x <= 0:
+        maiar_lib.print_fatal(f'Could not parse requirement (no version specified): {line}')
+
+    package = line[:x]
+
+    version = line[x + 1:]
+
+    package = package.strip()
+    version = version.strip().strip('=')
+
+    return package, version
+
+
+def build_package_list(packages):
+    package_list = []
+    already_specified_packages = set()
+
+    for p in packages:
+        p = p.strip()
+
+        if not p or p.startswith('#'):
+            continue
+
+        if p.endswith('.maiar'):
+            if not os.path.exists(p):
+                maiar_lib.print_fatal(f'Included requirements file not found: {p}')
+
+            with open(p) as f:
+                lines = f.read().split('\n')
+
+            addl_packages = build_package_list(lines)
+
+        else:
+            addl_packages = [parse_package_requirement(p)]
+
+        for package, version in addl_packages:
+            if package in already_specified_packages:
+                maiar_lib.print_fatal(f'Requirement {package}=={version} specified twice!')
+            already_specified_packages.add(package)
+
+        package_list.extend(addl_packages)
+
+    return package_list
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('stage', nargs=1, help='Stage to process',
+                        choices=['download', 'build', 'install', 'build_env', 'pip_env'])
+    parser.add_argument('packages', nargs='*',
+                        help='Packages to process, or a file with a list of requirements')
+    parser.add_argument('--repository', help='GCS Repository to download from')
+    parser.add_argument('--root-dir', help='Root directory for packages to be downloaded to and built from, '
+                        f'default is: {DEFAULT_ROOT_DIR}')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show steps, but do not actually download/build/install anything')
+    parser.add_argument('--skip-gcs', action='store_true',
+                        help='Do not access GCS, use only if package files are already downloaded')
+    parser.add_argument('--project',
+                        help='Google Cloud Storage project (only needed if specifying credentials manually)')
+    parser.add_argument('--token', help='Google Cloud Storage access token, optional if you are already logged in '
+        'locally (this can also be obtained by running gcloud auth application-default print-access-token)')
+    # NOTE: When building in docker, you will need to provide a token, such as:
+    # --build-arg GCLOUD_TOKEN=$(gcloud auth application-default print-access-token)
+    # Then run maiar with --token ${GCLOUD_TOKEN}
+
+    args = parser.parse_args()
+
+    stage = args.stage[0]
+
+    if stage == 'build_env':
+        print(maiar_lib.sha1_hash_from_data(maiar_lib.get_system_build_environment()))
+        sys.exit(0)
+
+    if stage == 'pip_env':
+        print(maiar_lib.sha1_hash_from_data(maiar_lib.get_python_build_environment()))
+        sys.exit(0)
+
+    if not args.packages:
+        maiar_lib.print_fatal(f'Must specify one of more packages to process, or a file with a list of requirements')
+
+    packages = build_package_list(args.packages)
+
+    if args.skip_gcs:
+        client = None
+        repo_path = None
+    else:
+        credentials = None
+        if args.token:
+            if not args.project:
+                maiar_lib.print_fatal(f'Must specify a Google Cloud Storage project if a token is provided')
+
+            import google.oauth2.credentials
+
+            credentials = google.oauth2.credentials.Credentials(args.token)
+
+        client = storage.Client(credentials=credentials, project=args.project)
+        repo_path = maiar_lib.detect_repository(args.repository)
+
+    # TODO: Support other channels (such as 'macosx')
+    maiar = MaiarBuild(client, repo_path, 'linux', args.root_dir)
+
+    for package, version in packages:
+        if not getattr(maiar, f'{stage}_package')(package, version, dry_run=args.dry_run):
+            sys.exit(1)
+
+    print('OK')
+
+
+if __name__ == '__main__':
+    main()

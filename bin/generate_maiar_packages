@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import re
+import sys
+
+from google.cloud import storage
+from google.api_core.exceptions import NotFound
+
+from maiar_lib import maiar_lib
+
+# This is the format: package-name.1.2.3
+package_format = re.compile(r'(?P<name>[A-Za-z0-9_\-]+)\.(?P<version>[0-9]+(\.[0-9]+)?(\.[0-9]+)?)')
+
+
+def verify_package_directory(dirname):
+    entries = os.listdir(dirname)
+    expected_scripts = {f'maiar{ext}' for ext in ['.sh', '.bash', '.py', '']}
+
+    n_found_scripts = len(set(entries) & expected_scripts)
+
+    if not n_found_scripts:
+        maiar_lib.print_fatal(f'No maiar install script found for package: {dirname}')
+
+    if n_found_scripts > 1:
+        maiar_lib.print_fatal(f'Too many maiar install scripts found for package: {dirname}')
+
+    if not maiar_lib.any_startswith_any(entries, ['DOWNLOADED_FROM', 'SOURCE_REPO']):
+        maiar_lib.print_fatal(f'No DOWNLOADED_FROM or SOURCE_REPO files found for package: {dirname}')
+
+    return True
+
+
+def parse_package_directory(check_dir):
+    if not os.path.isdir(check_dir):
+        return None
+
+    if check_dir.startswith('.'):
+        return None
+
+    pattern_match = package_format.match(check_dir)
+
+    if not pattern_match:
+        print(f'Skipping directory: {check_dir}')
+        return None
+
+    name = pattern_match.group('name')
+    version = pattern_match.group('version')
+    path = check_dir
+
+    if not verify_package_directory(check_dir):
+        return False
+
+    return {'name': name, 'version': version, 'path': path}
+
+
+def find_package_directories(start_dir):
+    parsed_package = parse_package_directory(start_dir)
+
+    if parsed_package:
+        return {parsed_package['name']: parsed_package}
+
+    packages = {}
+
+    if not os.path.isdir(start_dir):
+        return packages
+
+    entries = os.listdir(start_dir)
+
+    for entry in entries:
+        parsed_package = parse_package_directory(entry)
+
+        if not parsed_package:
+            continue
+
+        name = parsed_package['name']
+
+        if name in packages:
+            maiar_lib.print_error(f'Found duplicate package: {name}')
+            return False
+
+        packages[name] = parsed_package
+
+    return packages
+
+
+def build_package_list(package_directories):
+    packages = {}
+
+    for p_dir in package_directories:
+        addl_packages = find_package_directories(p_dir)
+
+        packages = maiar_lib.upsert_dicts(packages, addl_packages)
+
+        if packages is False:
+            return False
+
+    return packages
+
+
+class MaiarPackaging():
+    """Class for handling building and uploading of Maiar Packages"""
+    def __init__(self, gcs_client, repo_path, channel):
+        try:
+            self.repository = gcs_client.get_bucket(repo_path) if gcs_client else repo_path
+        except NotFound:
+            maiar_lib.print_fatal(f'Repository bucket {repo_path} not found in Google Cloud Storage!')
+
+        self.channel = channel
+        self.start_directory = os.getcwd()
+
+
+    def build_package(self, name, data, dry_run=False):
+        os.chdir(self.start_directory)
+
+        path = data['path']
+        version = data['version']
+        package_id = f'{name}.{version}'
+        package_file = f'{package_id}.tar.bz2'
+
+        if '/' in path:
+            os.chdir(path)
+            os.chdir('..')
+
+        tar_cmd = ['tar', '-cjf', package_file, f'{package_id}/']
+
+        if dry_run:
+            print(f'Would run {" ".join(tar_cmd)}')
+            return True
+        else:
+            print(f'Building package {package_id}')
+
+        success, output = maiar_lib.run_command_output(tar_cmd)
+
+        if not success:
+            maiar_lib.print_error(f'Archiving package {package_id} failed!')
+            print(output)
+            return False
+
+        return True
+
+    def push_package(self, name, data, dry_run=False):
+        if not self.repository:
+            maiar_lib.print_error(f'No repository was set!')
+            return False
+
+        os.chdir(self.start_directory)
+
+        path = data['path']
+        version = data['version']
+        package_id = f'{name}.{version}'
+        package_file = f'{package_id}.tar.bz2'
+
+        if '/' in path:
+            os.chdir(path)
+            os.chdir('..')
+
+        if not os.path.isfile(package_file):
+            maiar_lib.print_error(f'Package file {package_file} does not exist! '
+                                  'Please build this package first before attempting to upload it.')
+            return False
+
+        gcs_path = f'{self.channel}/{package_file}'
+
+        if dry_run:
+            print(f'Would upload: {package_file} to GCS repository at gs://{self.repository}/{gcs_path}')
+            return True
+        else:
+            print(f'Pushing package {package_id}')
+
+        blob = self.repository.blob(gcs_path)
+
+        maiar_lib.upload_file_with_retries(blob, package_file)
+
+        return True
+
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('stage', nargs=1, help='Stage to process', choices=['build', 'push'])
+    parser.add_argument('package_directories', nargs='+',
+                        help='Directory where package directories are found, or a list of package directories')
+
+    parser.add_argument('--repository', help='GCS Repository to upload to')
+    parser.add_argument('--dry-run', action='store_true', help='Show steps, but do not actually build/push anything')
+    parser.add_argument('--project',
+                        help='Google Cloud Storage project (only needed if specifying credentials manually)')
+    parser.add_argument('--token', help='Google Cloud Storage access token, optional if you are already logged in '
+        'locally (this can also be obtained by running gcloud auth application-default print-access-token)')
+    # NOTE: When building in docker, you will need to provide a token, such as:
+    # --build-arg GCLOUD_TOKEN=$(gcloud auth application-default print-access-token)
+    # Then run maiar with --token ${GCLOUD_TOKEN}
+
+    args = parser.parse_args()
+
+    stage = args.stage[0]
+
+    packages = build_package_list(args.package_directories)
+    if not packages:
+        if packages is not False:
+            maiar_lib.print_error(f'Could not find any packages!')
+
+        sys.exit(1)
+
+    if args.dry_run or stage != 'push':
+        client = None
+    else:
+        credentials = None
+        if args.token:
+            if not args.project:
+                maiar_lib.print_fatal(f'Must specify a Google Cloud Storage project if a token is provided')
+
+            import google.oauth2.credentials
+
+            credentials = google.oauth2.credentials.Credentials(args.token)
+
+        client = storage.Client(credentials=credentials, project=args.project)
+
+    repo_path = maiar_lib.detect_repository(args.repository)
+
+    maiar = MaiarPackaging(client, repo_path, 'linux')
+
+    for package_name, data in packages.items():
+        if not getattr(maiar, f'{stage}_package')(package_name, data, dry_run=args.dry_run):
+            sys.exit(1)
+
+    print('OK')
+
+
+if __name__ == '__main__':
+    main()

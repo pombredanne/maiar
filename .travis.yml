@@ -1,0 +1,43 @@
+language: python
+python:
+  - "3.6"
+before_install:
+  # Disable non-blocking I/O for stdout, stderr https://github.com/travis-ci/travis-ci/issues/4704#issuecomment-348435959
+  - python -c 'import os,sys,fcntl; flags = fcntl.fcntl(sys.stdout, fcntl.F_GETFL); fcntl.fcntl(sys.stdout, fcntl.F_SETFL, flags&~os.O_NONBLOCK);'
+  - python -c 'import os,sys,fcntl; flags = fcntl.fcntl(sys.stderr, fcntl.F_GETFL); fcntl.fcntl(sys.stderr, fcntl.F_SETFL, flags&~os.O_NONBLOCK);'
+install:
+- pip install -U pip
+- pip install -r requirements.txt
+- pip install -r test-requirements.txt
+cache: pip
+before_script:
+- python -m flake8
+script:
+- python -m pytest --cov=./maiar_lib tests/
+after_success:
+  - codecov
+# Build on merges to master
+branches:
+  only:
+    - master
+cache:
+  directories:
+    # https://docs.travis-ci.com/user/caching/#pip-cache
+    - "$HOME/.cache/pip"
+before_deploy:
+- python setup.py sdist
+deploy:
+- provider: packagecloud
+  repository: python
+  username: freenome
+  on:
+    tags: true
+  dist: python
+  package_glob: dist/*.{whl,zip,egg,egg-info,tar,bz2,Z,gz}
+  skip_cleanup: true
+  token:
+    secure: "RaQpeaSxBHUkF84ZTNrDucTwzC8Ikc04PLExeWgtQHQRO6WSRs72qepV1k/1LrpR8gL6G50/3dFlGZzwA0Kw7FC64V24nkxVdlvyTK8sx5IksnCKbJ6ayHWiH7MfTeRXvWj8vvyV7xsmVaVnAnaJNGumeluN0Sop9cz0c1zfwpXHrWdD7gZPcL7/hZQfAaeUGnV1HNxM39EYTFDhD3S4mJkA4YbVlCkMoO2TQ87aU3VwP0WQag3Qc3c4ErPLqXLz7RkSpwzMrYOzCCQyuIBr/dINkvtW56un+904TK0c+L8MUJUXZfduN5gD8aqdp1UuyeCEQjOrxCiDXqy8htm69+nbebGBOUXcSYvPecCyXC2fSGMeTjjIi0kHSLBQ6fkM8IO+ZBsP5VGn0l/ppZfHRYyvtBmm5hqxyp27OS2AOmq4ZPimkvSyNQpsNPHN4PWgo/gfjtCL4wTjQZ3no4NRoMvKROS2TEV1//Qkzze+Ld45aflzWcS8pmxZK3BOmclArbx4yFTc8jf88Ib/eGoI5ueIIG2cF60dcsDuGSO5MJ3QuKNDUT5bEpq50iJHqLLocLNv7B/zOMwlOu0Z1agmtvR8YUI1Bhmwdu+uJtQvLOvTWaJGq2Iz3HE9LpbVieKyqjsj+rIqtgyAmZpVrobU6345YY4GeQrVJL25ubEGedA="
+env:
+  global:
+    # Codecov token
+    - secure: "Iy1N1Gd+mUgDYDVNguMGxtJagAsV3XV5130ffkAe02AtAoAfQ7Tee6fSgwWwgiVkPsF5n82W2rsaWqZeJzf5bKm15sVr6+e8aTa1GyPHdGwOKfs96j1TlWRTLF5yl158A+ELxMB2z2ON0yYNaNQYHRrpJa2UGrdTAoz06gjmo9CKe2WnDa5loEwqw/4mdyH39zKRDZ1jhrkGo1OgLyrdVvTIBkA37FQwzidV4qLaGylctHvkhsP4FnzHq5pRp0kncrOUFk93cScCN7H2abf/DxoJEqGroq5gZoPFH/nMrWWNj1uMuV+GHWdM2As6Po3VtZ1odmWGwJ8Ty/LQytcVjuhKdyppgRsd0FFszU4xQiS+Zr4TvOmOqlOlfHSRSsvu4ZED0kXccFt08xSavZQgrEXg+UeV0n4AvsDMJb8mBNyA+txCwpu0Uwh9CiGiICBKGh8c9/zz0Wwgf/AeRUuaQk++e8D4t/QZnQXs+FrlGuuqqHcKD/9u96j+p4lekCK0hincbd3Y1LylSxr/DiadEyNobJQvymKXsnmoCtY7ETIJ4Ir/KIsxIIsBUqkozm8Itg0vzU4ZYo9O658jcDMyj4hC3LOF4cMrjFMTVkU3UHbJKnlxMd14EHzga6Tc+DQL+G8GrvYpFRf7qv/f81RqVGN2WEHZRUvx2QfENv6F0tM="
