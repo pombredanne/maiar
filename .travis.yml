@@ -16,12 +16,6 @@ script:
 - python -m pytest --cov=./maiar_lib tests/
 after_success:
   - codecov
-# Build on merges to master and new version tags
-# See: https://docs.travis-ci.com/user/customizing-the-build/#using-regular-expressions
-branches:
-  only:
-    - master
-    - "/v(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(-(0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(\\.(0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?(\\+[0-9a-zA-Z-]+(\\.[0-9a-zA-Z-]+)*)?/"
 cache:
   directories:
     # https://docs.travis-ci.com/user/caching/#pip-cache
