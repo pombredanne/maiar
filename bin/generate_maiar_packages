@@ -10,8 +10,8 @@ from google.api_core.exceptions import NotFound
 
 from maiar_lib import maiar_lib
 
-# This is the format: package-name.1.2.3
-package_format = re.compile(r'(?P<name>[A-Za-z0-9_\-]+)\.(?P<version>[0-9]+(\.[0-9]+)?(\.[0-9]+)?)')
+# This is the format: package-name.1.2.3.date
+package_format = re.compile(r'(?P<name>[A-Za-z0-9_\-]+)\.(?P<version>[0-9]+(\.[0-9]+)?(\.[0-9]+)(\.[0-9]+)?)')
 
 
 def verify_package_directory(dirname):
