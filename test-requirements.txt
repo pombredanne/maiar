@@ -1,4 +1,4 @@
 codecov==2.0.17
-flake8==3.7.9
+flake8==3.8.2
 pytest==5.4.1
 pytest-cov==2.5.1
